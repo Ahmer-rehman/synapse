@@ -1,0 +1,53 @@
+--
+-- This file is licensed under the Affero General Public License (AGPL) version 3.
+--
+-- Copyright (C) 2024 New Vector, Ltd
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as
+-- published by the Free Software Foundation, either version 3 of the
+-- License, or (at your option) any later version.
+--
+-- See the GNU Affero General Public License for more details:
+-- <https://www.gnu.org/licenses/agpl-3.0.html>.
+
+
+CREATE TABLE sliding_sync_connection_state(
+    connection_key PRIMARY KEY BIGINT GENERATED ALWAYS AS IDENTITY,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    conn_id TEXT NOT NULL,
+    created_ts BIGINT NOT NULL
+);
+
+CREATE TABLE sliding_sync_connection_state_positions(
+    connection_position PRIMARY KEY BIGINT GENERATED ALWAYS AS IDENTITY,
+    connection_key BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_key) ON DELETE CASCADE,
+    created_ts BIGINT NOT NULL
+);
+
+CREATE TABLE sliding_sync_connection_rooms(
+    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
+    room_id BIGINT NOT NULL,
+    room_status TEXT NOT NULL,
+    last_position TEXT,
+    timeline_limit BIGINT NOT NULL,
+    required_state_id BIGINT NOT NULL REFERENCES(sliding_sync_connection_required_state)
+);
+
+CREATE UNIQUE INDEX sliding_sync_connection_rooms_idx ON sliding_sync_connection_rooms(connection_position, room_id);
+
+CREATE TABLE sliding_sync_connection_required_state(
+    required_state_id PRIMARY KEY BIGINT GENERATED ALWAYS AS IDENTITY,
+    connection_key BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_key) ON DELETE CASCADE,
+    required_state TEXT NOT NULL
+);
+
+CREATE INDEX sliding_sync_connection_required_state_conn_pos ON sliding_sync_connection_state(connection_key);
+
+CREATE TABLE sliding_sync_connection_receipts(
+    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_position) ON DELETE CASCADE,
+    room_id BIGINT NOT NULL,
+    room_status TEXT NOT NULL,
+    last_position TEXT NOT NULL
+);
