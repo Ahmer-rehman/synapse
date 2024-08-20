@@ -26,16 +26,14 @@ CREATE TABLE sliding_sync_connection_state_positions(
     created_ts BIGINT NOT NULL
 );
 
-CREATE TABLE sliding_sync_connection_rooms(
+CREATE TABLE sliding_sync_connection_room_configs(
     connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
     room_id BIGINT NOT NULL,
-    room_status TEXT NOT NULL,
-    last_position TEXT,
     timeline_limit BIGINT NOT NULL,
     required_state_id BIGINT NOT NULL REFERENCES(sliding_sync_connection_required_state)
 );
 
-CREATE UNIQUE INDEX sliding_sync_connection_rooms_idx ON sliding_sync_connection_rooms(connection_position, room_id);
+CREATE UNIQUE INDEX sliding_sync_connection_room_configs_idx ON sliding_sync_connection_room_configs(connection_position, room_id);
 
 CREATE TABLE sliding_sync_connection_required_state(
     required_state_id PRIMARY KEY BIGINT GENERATED ALWAYS AS IDENTITY,
@@ -45,9 +43,12 @@ CREATE TABLE sliding_sync_connection_required_state(
 
 CREATE INDEX sliding_sync_connection_required_state_conn_pos ON sliding_sync_connection_state(connection_key);
 
-CREATE TABLE sliding_sync_connection_receipts(
-    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_position) ON DELETE CASCADE,
+CREATE TABLE sliding_sync_connection_streams(
+    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
+    stream TEXT NOT NULL,
     room_id BIGINT NOT NULL,
     room_status TEXT NOT NULL,
-    last_position TEXT NOT NULL
+    last_position TEXT
 );
+
+CREATE UNIQUE INDEX sliding_sync_connection_streams_idx ON sliding_sync_connection_streams(connection_position, room_id);

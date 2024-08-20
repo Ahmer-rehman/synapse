@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from synapse.handlers.sliding_sync import (
         MutablePerConnectionState,
         PerConnectionState,
-        RoomStatusesForStream,
+        RoomStatusMap,
     )
 
 
@@ -42,12 +42,13 @@ class SlidingSyncStore(SQLBaseStore):
     ) -> int:
         return await self.db_pool.runInteraction(
             "persist_per_connection_state",
+            self.persist_per_connection_state_txn,
             user_id=user_id,
             device_id=device_id,
             conn_id=conn_id,
             previous_connection_position=previous_connection_position,
             per_connection_state=await PerConnectionStateDB.from_state(
-                per_connection_state
+                per_connection_state, self
             ),
         )
 
@@ -103,6 +104,7 @@ class SlidingSyncStore(SQLBaseStore):
 
         if previous_connection_position is not None:
             rows = self.db_pool.simple_select_list_txn(
+                txn,
                 table="sliding_sync_connection_required_state",
                 keyvalues={"connection_key": connection_key},
                 retcols=("required_state_id", "required_state"),
@@ -112,16 +114,16 @@ class SlidingSyncStore(SQLBaseStore):
 
         room_to_state_ids: Dict[str, int] = {}
         unique_required_state: Dict[str, List[str]] = {}
-        for room_id, room_state in per_connection_state.previous_room_configs.items():
-            serialized_state = encode_canonical_json(room_state.required_state_map)
+        for room_id, room_state in per_connection_state.room_configs.items():
+            serialized_state = encode_canonical_json(
+                room_state.required_state_map
+            ).decode()
 
             existing_state_id = required_state_to_id.get(serialized_state)
             if existing_state_id is not None:
                 room_to_state_ids[room_id] = existing_state_id
             else:
-                unique_required_state.setdefault(
-                    serialized_state.decode("utf-8"), []
-                ).append(room_id)
+                unique_required_state.setdefault(serialized_state, []).append(room_id)
 
         for serialized_required_state, room_ids in unique_required_state.items():
             (required_state_id,) = self.db_pool.simple_insert_returning_txn(
@@ -138,22 +140,52 @@ class SlidingSyncStore(SQLBaseStore):
 
         if previous_connection_position is not None:
             sql = """
-                INSERT INTO sliding_sync_connection_rooms
-                (connection_position, room_id, room_status, last_position, timeline_limit, required_state_id)
-                SELECT ?, room_id, room_status, last_position, timeline_limit, required_state_id
-                FROM sliding_sync_connection_rooms
+                INSERT INTO sliding_sync_connection_streams
+                (connection_position, stream, room_id, room_status, last_position, timeline_limit, required_state_id)
+                SELECT ?, stream, room_id, room_status, last_position, timeline_limit, required_state_id
+                FROM sliding_sync_connection_streams
                 WHERE connection_position = ?
             """
             txn.execute(sql, (connection_position, previous_connection_position))
 
         self.db_pool.simple_insert_many_txn(
             txn,
-            table="sliding_sync_connection_rooms",
+            table="sliding_sync_connection_streams",
             keys=(
                 "connection_position",
+                "stream",
                 "room_id",
                 "room_status",
                 "last_position",
+            ),
+            values=[
+                (
+                    connection_position,
+                    "rooms",
+                    room_id,
+                    have_sent_room.status.value,
+                    have_sent_room.last_token,
+                )
+                for room_id, have_sent_room in per_connection_state.rooms._statuses.items()
+            ]
+            + [
+                (
+                    connection_position,
+                    "receipts",
+                    room_id,
+                    have_sent_room.status.value,
+                    have_sent_room.last_token,
+                )
+                for room_id, have_sent_room in per_connection_state.receipts._statuses.items()
+            ],
+        )
+
+        self.db_pool.simple_insert_many_txn(
+            txn,
+            table="sliding_sync_connection_room_configs",
+            keys=(
+                "connection_position",
+                "room_id",
                 "timeline_limit",
                 "required_state_id",
             ),
@@ -161,42 +193,10 @@ class SlidingSyncStore(SQLBaseStore):
                 (
                     connection_position,
                     room_id,
-                    have_sent_room.status.value,
-                    have_sent_room.last_token,  # TODO: serialize...
-                    per_connection_state.previous_room_configs[room_id].timeline_limit,
+                    room_config.timeline_limit,
                     room_to_state_ids[room_id],
                 )
-                for room_id, have_sent_room in per_connection_state.rooms._statuses.items()
-            ],
-        )
-
-        if previous_connection_position is not None:
-            sql = """
-                INSERT INTO sliding_sync_connection_receipts
-                (connection_position, room_id, room_status, last_position)
-                SELECT ?, room_id, room_status, last_position
-                FROM sliding_sync_connection_receipts
-                WHERE connection_position = ?
-            """
-            txn.execute(sql, (connection_position, previous_connection_position))
-
-        self.db_pool.simple_insert_many_txn(
-            txn,
-            table="sliding_sync_connection_receipts",
-            keys=(
-                "connection_position",
-                "room_id",
-                "room_status",
-                "last_position",
-            ),
-            values=[
-                (
-                    connection_position,
-                    room_id,
-                    have_sent_room.status.value,
-                    have_sent_room.last_token,  # TODO: serialize...
-                )
-                for room_id, have_sent_room in per_connection_state.receipts._statuses.items()
+                for room_id, room_config in per_connection_state.room_configs.items()
             ],
         )
 
@@ -205,10 +205,15 @@ class SlidingSyncStore(SQLBaseStore):
     async def get_per_connection_state(
         self, user_id: str, device_id: str, conn_id: str, connection_position: int
     ) -> "PerConnectionState":
-        return await self.db_pool.runInteraction(
+        per_connection_state_db = await self.db_pool.runInteraction(
             "get_per_connection_state",
+            self._get_per_connection_state_txn,
+            user_id=user_id,
+            device_id=device_id,
+            conn_id=conn_id,
             connection_position=connection_position,
         )
+        return await per_connection_state_db.to_state(self)
 
     def _get_per_connection_state_txn(
         self,
@@ -250,51 +255,80 @@ class SlidingSyncStore(SQLBaseStore):
             ),
         )
 
-        required_state_map = {
-            row["required_state_id"]: db_to_json(row["required_state"]) for row in rows
-        }
+        required_state_map = {row[0]: db_to_json(row[1]) for row in rows}
 
-        rooms = self.db_pool.simple_select_list_txn(
+        room_config_rows = self.db_pool.simple_select_list_txn(
             txn,
-            table="sliding_sync_connection_rooms",
+            table="sliding_sync_connection_room_configs",
             keyvalues={"connection_position": connection_position},
             retcols=(
                 "room_id",
-                "room_status",
-                "last_position",
                 "timeline_limit",
                 "required_state_id",
             ),
         )
 
-        rooms = {}
-        previous_room_configs = {}
+        rooms: Dict[str, HaveSentRoom[str]] = {}
+        receipts: Dict[str, HaveSentRoom[str]] = {}
+        room_configs: Dict[str, RoomSyncConfig] = {}
 
         for (
             room_id,
-            room_status,
-            last_position,
             timeline_limit,
             required_state_id,
-        ) in rooms:
-            rooms[room_id] = HaveSentRoom(
-                status=HaveSentRoomFlag(room_status), last_position=last_position
+        ) in room_config_rows:
+            room_configs[room_id] = RoomSyncConfig(
+                timeline_limit=timeline_limit,
+                required_state_map=required_state_map[required_state_id],
             )
+
+        sql = """
+            SELECT 'rooms', room_id, room_status, last_position FROM sliding_sync_connection_rooms
+            UNION ALL
+            SELECT 'receipts', room_id, room_status, last_position FROM sliding_sync_connection_receipts
+        """
+
+        # TODO receipts
+        receipt_rows = self.db_pool.simple_select_list_txn(
+            txn,
+            table="sliding_sync_connection_streams",
+            keyvalues={"connection_position": connection_position},
+            retcols=(
+                "stream",
+                "room_id",
+                "room_status",
+                "last_position",
+            ),
+        )
+        for stream, room_id, room_status, last_position in receipt_rows:
+            have_sent_room: HaveSentRoom[str] = HaveSentRoom(
+                status=HaveSentRoomFlag(room_status), last_token=last_position
+            )
+            if stream == "rooms":
+                rooms[room_id] = have_sent_room
+            elif stream == "receipts":
+                receipts[room_id] = have_sent_room
+
+        return PerConnectionStateDB(
+            rooms=RoomStatusMap(rooms),
+            receipts=RoomStatusMap(receipts),
+            room_configs=room_configs,
+        )
 
 
 @attr.s(auto_attribs=True)
 class PerConnectionStateDB:
-    rooms: RoomStatusesForStream[str]
-    receipts: RoomStatusesForStream[str]
+    rooms: "RoomStatusMap[str]"
+    receipts: "RoomStatusMap[str]"
 
-    previous_room_configs: Mapping[str, RoomSyncConfig]
+    room_configs: Mapping[str, "RoomSyncConfig"]
 
     @staticmethod
     async def from_state(
         per_connection_state: "MutablePerConnectionState", store: "SlidingSyncStore"
     ) -> "PerConnectionStateDB":
         rooms = {
-            room_id: HaveSentRoomFlag(
+            room_id: HaveSentRoom(
                 status=status.status,
                 last_token=(
                     await status.last_token.to_string(store)
@@ -306,7 +340,7 @@ class PerConnectionStateDB:
         }
 
         receipts = {
-            room_id: HaveSentRoomFlag(
+            room_id: HaveSentRoom(
                 status=status.status,
                 last_token=(
                     await status.last_token.to_string(store)
@@ -318,14 +352,14 @@ class PerConnectionStateDB:
         }
 
         return PerConnectionStateDB(
-            rooms=rooms,
-            receipts=receipts,
-            previous_room_configs=per_connection_state.previous_room_configs,
+            rooms=RoomStatusMap(rooms),
+            receipts=RoomStatusMap(receipts),
+            room_configs=per_connection_state.room_configs.maps[0],
         )
 
     async def to_state(self, store: "SlidingSyncStore") -> "PerConnectionState":
         rooms = {
-            room_id: HaveSentRoomFlag(
+            room_id: HaveSentRoom(
                 status=status.status,
                 last_token=(
                     await RoomStreamToken.parse(store, status.last_token)
@@ -337,7 +371,7 @@ class PerConnectionStateDB:
         }
 
         receipts = {
-            room_id: HaveSentRoomFlag(
+            room_id: HaveSentRoom(
                 status=status.status,
                 last_token=(
                     await MultiWriterStreamToken.parse(store, status.last_token)
@@ -348,8 +382,8 @@ class PerConnectionStateDB:
             for room_id, status in self.receipts._statuses.items()
         }
 
-        return PerConnectionStateDB(
-            rooms=rooms,
-            receipts=receipts,
-            previous_room_configs=self.previous_room_configs,
+        return PerConnectionState(
+            rooms=RoomStatusMap(rooms),
+            receipts=RoomStatusMap(receipts),
+            room_configs=self.room_configs,
         )

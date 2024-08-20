@@ -1098,7 +1098,10 @@ class DatabasePool:
 
     @staticmethod
     def simple_insert_returning_txn(
-        txn: LoggingTransaction, table: str, values: Dict[str, Any], returning: StrCollection
+        txn: LoggingTransaction,
+        table: str,
+        values: Dict[str, Any],
+        returning: StrCollection,
     ) -> Tuple[Any, ...]:
         keys, vals = zip(*values.items())
 
