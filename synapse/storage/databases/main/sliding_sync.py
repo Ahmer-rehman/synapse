@@ -168,6 +168,15 @@ class SlidingSyncStore(SQLBaseStore):
             """
             txn.execute(sql, (connection_position, previous_connection_position))
 
+            sql = """
+                INSERT INTO sliding_sync_connection_room_configs
+                (connection_position, room_id, timeline_limit, required_state_id)
+                SELECT ?, room_id, timeline_limit, required_state_id
+                FROM sliding_sync_connection_room_configs
+                WHERE connection_position = ?
+            """
+            txn.execute(sql, (connection_position, previous_connection_position))
+
         key_values = []
         value_values = []
         for room_id, have_sent_room in per_connection_state.rooms._statuses.items():
