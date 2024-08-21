@@ -207,24 +207,25 @@ class SlidingSyncStore(SQLBaseStore):
             value_values=value_values,
         )
 
-        self.db_pool.simple_insert_many_txn(
+        keys = []
+        values = []
+        for room_id, room_config in per_connection_state.room_configs.items():
+            keys.append((connection_position, room_id))
+            values.append((room_config.timeline_limit, room_to_state_ids[room_id]))
+
+        self.db_pool.simple_upsert_many_txn(
             txn,
             table="sliding_sync_connection_room_configs",
-            keys=(
+            key_names=(
                 "connection_position",
                 "room_id",
+            ),
+            key_values=keys,
+            value_names=(
                 "timeline_limit",
                 "required_state_id",
             ),
-            values=[
-                (
-                    connection_position,
-                    room_id,
-                    room_config.timeline_limit,
-                    room_to_state_ids[room_id],
-                )
-                for room_id, room_config in per_connection_state.room_configs.items()
-            ],
+            value_values=values,
         )
 
         return connection_position
