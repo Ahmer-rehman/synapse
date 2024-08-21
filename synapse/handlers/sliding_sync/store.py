@@ -100,6 +100,15 @@ class SlidingSyncConnectionStore:
         If there are no changes to the state this may return the same token as
         the existing per-connection state.
         """
+        if not new_connection_state.has_updates():
+            if from_token is not None:
+                return from_token.connection_position
+            else:
+                return 0
+
+        if from_token is not None and from_token.connection_position == 0:
+            from_token = None
+
         conn_id = sync_config.conn_id or ""
 
         device_id = sync_config.requester.device_id
