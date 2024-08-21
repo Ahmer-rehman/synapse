@@ -19,6 +19,7 @@ import attr
 from canonicaljson import encode_canonical_json
 
 from synapse.api.errors import SlidingSyncUnknownPosition
+from synapse.logging.opentracing import log_kv
 from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.database import LoggingTransaction
 from synapse.types import MultiWriterStreamToken, RoomStreamToken
@@ -374,6 +375,14 @@ class PerConnectionStateDB:
             )
             for room_id, status in per_connection_state.receipts.get_updates().items()
         }
+
+        log_kv(
+            {
+                "rooms": rooms,
+                "receipts": receipts,
+                "room_configs": per_connection_state.room_configs.maps[0],
+            }
+        )
 
         return PerConnectionStateDB(
             rooms=RoomStatusMap(rooms),
