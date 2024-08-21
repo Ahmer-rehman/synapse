@@ -13,22 +13,22 @@
 #
 
 
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
 import attr
 from canonicaljson import encode_canonical_json
 
-from synapse.handlers.sliding_sync import HaveSentRoom, HaveSentRoomFlag, RoomSyncConfig
 from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.database import LoggingTransaction
 from synapse.types import MultiWriterStreamToken, RoomStreamToken
-
-if TYPE_CHECKING:
-    from synapse.handlers.sliding_sync import (
-        MutablePerConnectionState,
-        PerConnectionState,
-        RoomStatusMap,
-    )
+from synapse.types.handlers.sliding_sync import (
+    HaveSentRoom,
+    HaveSentRoomFlag,
+    MutablePerConnectionState,
+    PerConnectionState,
+    RoomStatusMap,
+    RoomSyncConfig,
+)
 
 
 class SlidingSyncStore(SQLBaseStore):
