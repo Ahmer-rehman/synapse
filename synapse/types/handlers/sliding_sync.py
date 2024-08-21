@@ -835,6 +835,9 @@ class PerConnectionState:
             room_configs=dict(self.room_configs),
         )
 
+    def __len__(self) -> int:
+        return len(self.rooms) + len(self.receipts) + len(self.room_configs)
+
 
 @attr.s(auto_attribs=True)
 class MutablePerConnectionState(PerConnectionState):

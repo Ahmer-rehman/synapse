@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, cast
 import attr
 from canonicaljson import encode_canonical_json
 
+from synapse.api.errors import SlidingSyncUnknownPosition
 from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.database import LoggingTransaction
 from synapse.types import MultiWriterStreamToken, RoomStreamToken
@@ -66,21 +67,22 @@ class SlidingSyncStore(SQLBaseStore):
         per_connection_state: "PerConnectionStateDB",
     ) -> int:
         if previous_connection_position is not None:
-            connection_key = self.db_pool.simple_select_one_onecol_txn(
-                txn,
-                table="sliding_sync_connection_state",
-                keyvalues={
-                    "connection_position": previous_connection_position,
-                    "user_id": user_id,
-                    "device_id": device_id,
-                    "conn_id": conn_id,
-                },
-                retcol="connection_key",
-                allow_none=True,
+            sql = """
+                SELECT connection_key
+                FROM sliding_sync_connection_state_positions
+                INNER JOIN sliding_sync_connection_state USING (connection_key)
+                WHERE
+                    connection_position = ?
+                    AND user_id = ? AND device_id = ? AND conn_id = ?
+            """
+            txn.execute(
+                sql, (previous_connection_position, user_id, device_id, conn_id)
             )
-            if connection_key is None:
-                # TODO: Raise the unknown pos key
-                raise Exception()
+            row = txn.fetchone()
+            if row is None:
+                raise SlidingSyncUnknownPosition()
+
+            (connection_key,) = row
         else:
             (connection_key,) = self.db_pool.simple_insert_returning_txn(
                 txn,
@@ -120,7 +122,10 @@ class SlidingSyncStore(SQLBaseStore):
         unique_required_state: Dict[str, List[str]] = {}
         for room_id, room_state in per_connection_state.room_configs.items():
             serialized_state = encode_canonical_json(
-                room_state.required_state_map
+                {
+                    event_type: list(state_keys)
+                    for event_type, state_keys in room_state.required_state_map.items()
+                }
             ).decode()
 
             existing_state_id = required_state_to_id.get(serialized_state)
@@ -134,7 +139,7 @@ class SlidingSyncStore(SQLBaseStore):
                 txn,
                 table="sliding_sync_connection_required_state",
                 values={
-                    "connection_position": connection_position,
+                    "connection_key": connection_key,
                     "required_state": serialized_required_state,
                 },
                 returning=("required_state_id",),
@@ -145,43 +150,41 @@ class SlidingSyncStore(SQLBaseStore):
         if previous_connection_position is not None:
             sql = """
                 INSERT INTO sliding_sync_connection_streams
-                (connection_position, stream, room_id, room_status, last_position, timeline_limit, required_state_id)
-                SELECT ?, stream, room_id, room_status, last_position, timeline_limit, required_state_id
+                (connection_position, stream, room_id, room_status, last_position)
+                SELECT ?, stream, room_id, room_status, last_position
                 FROM sliding_sync_connection_streams
                 WHERE connection_position = ?
             """
             txn.execute(sql, (connection_position, previous_connection_position))
 
-        self.db_pool.simple_insert_many_txn(
+        key_values = []
+        value_values = []
+        for room_id, have_sent_room in per_connection_state.rooms._statuses.items():
+            key_values.append((connection_position, "rooms", room_id))
+            value_values.append(
+                (have_sent_room.status.value, have_sent_room.last_token)
+            )
+
+        for room_id, have_sent_room in per_connection_state.receipts._statuses.items():
+            key_values.append((connection_position, "receipts", room_id))
+            value_values.append(
+                (have_sent_room.status.value, have_sent_room.last_token)
+            )
+
+        self.db_pool.simple_upsert_many_txn(
             txn,
             table="sliding_sync_connection_streams",
-            keys=(
+            key_names=(
                 "connection_position",
                 "stream",
                 "room_id",
+            ),
+            key_values=key_values,
+            value_names=(
                 "room_status",
                 "last_position",
             ),
-            values=[
-                (
-                    connection_position,
-                    "rooms",
-                    room_id,
-                    have_sent_room.status.value,
-                    have_sent_room.last_token,
-                )
-                for room_id, have_sent_room in per_connection_state.rooms._statuses.items()
-            ]
-            + [
-                (
-                    connection_position,
-                    "receipts",
-                    room_id,
-                    have_sent_room.status.value,
-                    have_sent_room.last_token,
-                )
-                for room_id, have_sent_room in per_connection_state.receipts._statuses.items()
-            ],
+            value_values=value_values,
         )
 
         self.db_pool.simple_insert_many_txn(
@@ -206,6 +209,7 @@ class SlidingSyncStore(SQLBaseStore):
 
         return connection_position
 
+    @cached(iterable=True)
     async def get_per_connection_state(
         self, user_id: str, device_id: str, conn_id: str, connection_position: int
     ) -> "PerConnectionState":
@@ -228,21 +232,20 @@ class SlidingSyncStore(SQLBaseStore):
         conn_id: str,
         connection_position: int,
     ) -> "PerConnectionStateDB":
-        connection_key = self.db_pool.simple_select_one_onecol_txn(
-            txn,
-            table="sliding_sync_connection_state",
-            keyvalues={
-                "connection_position": connection_position,
-                "user_id": user_id,
-                "device_id": device_id,
-                "conn_id": conn_id,
-            },
-            retcol="connection_key",
-            allow_none=True,
-        )
-        if connection_key is None:
-            # TODO: Raise the unknown pos key
-            raise Exception()
+        sql = """
+            SELECT connection_key
+            FROM sliding_sync_connection_state_positions
+            INNER JOIN sliding_sync_connection_state USING (connection_key)
+            WHERE
+                connection_position = ?
+                AND user_id = ? AND device_id = ? AND conn_id = ?
+        """
+        txn.execute(sql, (connection_position, user_id, device_id, conn_id))
+        row = txn.fetchone()
+        if row is None:
+            raise SlidingSyncUnknownPosition()
+
+        (connection_key,) = row
 
         sql = """
             DELETE FROM sliding_sync_connection_state_positions
@@ -260,7 +263,13 @@ class SlidingSyncStore(SQLBaseStore):
             ),
         )
 
-        required_state_map = {row[0]: db_to_json(row[1]) for row in rows}
+        required_state_map = {
+            row[0]: {
+                event_type: set(state_keys)
+                for event_type, state_keys in db_to_json(row[1]).items()
+            }
+            for row in rows
+        }
 
         room_config_rows = self.db_pool.simple_select_list_txn(
             txn,

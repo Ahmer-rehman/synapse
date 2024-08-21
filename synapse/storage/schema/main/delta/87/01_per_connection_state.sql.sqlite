@@ -13,7 +13,7 @@
 
 
 CREATE TABLE sliding_sync_connection_state(
-    connection_key BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    connection_key INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     conn_id TEXT NOT NULL,
@@ -21,23 +21,21 @@ CREATE TABLE sliding_sync_connection_state(
 );
 
 CREATE TABLE sliding_sync_connection_state_positions(
-    connection_position BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    connection_position INTEGER PRIMARY KEY AUTOINCREMENT,
     connection_key BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_key) ON DELETE CASCADE,
     created_ts BIGINT NOT NULL
 );
 
-
 CREATE TABLE sliding_sync_connection_required_state(
-    required_state_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    required_state_id INTEGER PRIMARY KEY AUTOINCREMENT,
     connection_key BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_key) ON DELETE CASCADE,
     required_state TEXT NOT NULL
 );
 
 CREATE INDEX sliding_sync_connection_required_state_conn_pos ON sliding_sync_connection_state(connection_key);
 
-
 CREATE TABLE sliding_sync_connection_room_configs(
-    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
+    connection_position INTEGER NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
     room_id TEXT NOT NULL,
     timeline_limit BIGINT NOT NULL,
     required_state_id BIGINT NOT NULL REFERENCES sliding_sync_connection_required_state(required_state_id)
@@ -46,7 +44,7 @@ CREATE TABLE sliding_sync_connection_room_configs(
 CREATE UNIQUE INDEX sliding_sync_connection_room_configs_idx ON sliding_sync_connection_room_configs(connection_position, room_id);
 
 CREATE TABLE sliding_sync_connection_streams(
-    connection_position BIGINT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
+    connection_position INT NOT NULL REFERENCES sliding_sync_connection_state_positions(connection_position) ON DELETE CASCADE,
     stream TEXT NOT NULL,
     room_id TEXT NOT NULL,
     room_status TEXT NOT NULL,
