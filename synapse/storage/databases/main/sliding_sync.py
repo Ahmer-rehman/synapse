@@ -13,7 +13,7 @@
 #
 
 
-from typing import Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, cast
 
 import attr
 from canonicaljson import encode_canonical_json
@@ -30,6 +30,9 @@ from synapse.types.handlers.sliding_sync import (
     RoomSyncConfig,
 )
 
+if TYPE_CHECKING:
+    from synapse.storage.databases.main import DataStore
+
 
 class SlidingSyncStore(SQLBaseStore):
     async def persist_per_connection_state(
@@ -40,6 +43,7 @@ class SlidingSyncStore(SQLBaseStore):
         previous_connection_position: Optional[int],
         per_connection_state: "MutablePerConnectionState",
     ) -> int:
+        store = cast("DataStore", self)
         return await self.db_pool.runInteraction(
             "persist_per_connection_state",
             self.persist_per_connection_state_txn,
@@ -48,7 +52,7 @@ class SlidingSyncStore(SQLBaseStore):
             conn_id=conn_id,
             previous_connection_position=previous_connection_position,
             per_connection_state=await PerConnectionStateDB.from_state(
-                per_connection_state, self
+                per_connection_state, store
             ),
         )
 
@@ -213,7 +217,8 @@ class SlidingSyncStore(SQLBaseStore):
             conn_id=conn_id,
             connection_position=connection_position,
         )
-        return await per_connection_state_db.to_state(self)
+        store = cast("DataStore", self)
+        return await per_connection_state_db.to_state(store)
 
     def _get_per_connection_state_txn(
         self,
@@ -325,7 +330,7 @@ class PerConnectionStateDB:
 
     @staticmethod
     async def from_state(
-        per_connection_state: "MutablePerConnectionState", store: "SlidingSyncStore"
+        per_connection_state: "MutablePerConnectionState", store: "DataStore"
     ) -> "PerConnectionStateDB":
         rooms = {
             room_id: HaveSentRoom(
@@ -357,7 +362,7 @@ class PerConnectionStateDB:
             room_configs=per_connection_state.room_configs.maps[0],
         )
 
-    async def to_state(self, store: "SlidingSyncStore") -> "PerConnectionState":
+    async def to_state(self, store: "DataStore") -> "PerConnectionState":
         rooms = {
             room_id: HaveSentRoom(
                 status=status.status,
