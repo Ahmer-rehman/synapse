@@ -39,19 +39,27 @@ from typing import (
 
 import attr
 from prometheus_client import Counter
+from typing_extensions import TypedDict
 
 import synapse.metrics
-from synapse.api.constants import EventContentFields, EventTypes, RelationTypes
+from synapse.api.constants import (
+    EventContentFields,
+    EventTypes,
+    Membership,
+    RelationTypes,
+)
 from synapse.api.errors import PartialStateConflictError
 from synapse.api.room_versions import RoomVersions
-from synapse.events import EventBase, relation_from_event
+from synapse.events import EventBase, StrippedStateEvent, relation_from_event
 from synapse.events.snapshot import EventContext
+from synapse.events.utils import parse_stripped_state_event
 from synapse.logging.opentracing import trace
 from synapse.storage._base import db_to_json, make_in_list_sql_clause
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
     LoggingTransaction,
+    make_tuple_in_list_sql_clause,
 )
 from synapse.storage.databases.main.event_federation import EventFederationStore
 from synapse.storage.databases.main.events_worker import EventCacheEntry
@@ -59,7 +67,14 @@ from synapse.storage.databases.main.search import SearchEntry
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.util.id_generators import AbstractStreamIdGenerator
 from synapse.storage.util.sequence import SequenceGenerator
-from synapse.types import JsonDict, StateMap, StrCollection, get_domain_from_id
+from synapse.types import (
+    JsonDict,
+    MutableStateMap,
+    StateMap,
+    StrCollection,
+    get_domain_from_id,
+)
+from synapse.types.handlers import SLIDING_SYNC_DEFAULT_BUMP_EVENT_TYPES
 from synapse.util import json_encoder
 from synapse.util.iterutils import batch_iter, sorted_topologically
 from synapse.util.stringutils import non_null_str_or_none
@@ -77,6 +92,17 @@ event_counter = Counter(
     "",
     ["type", "origin_type", "origin_entity"],
 )
+
+# State event type/key pairs that we need to gather to fill in the
+# `sliding_sync_joined_rooms`/`sliding_sync_membership_snapshots` tables.
+SLIDING_SYNC_RELEVANT_STATE_SET = {
+    # So we can fill in the `room_type` column in the `sliding_sync_joined_rooms` table
+    (EventTypes.Create, ""),
+    # So we can fill in the `is_encrypted` column in the `sliding_sync_joined_rooms` table
+    (EventTypes.RoomEncryption, ""),
+    # So we can fill in the `room_name` column in the `sliding_sync_joined_rooms` table
+    (EventTypes.Name, ""),
+}
 
 
 @attr.s(slots=True, auto_attribs=True)
@@ -97,6 +123,58 @@ class DeltaState:
     def is_noop(self) -> bool:
         """Whether this state delta is actually empty"""
         return not self.to_delete and not self.to_insert and not self.no_longer_in_room
+
+
+# We want `total=False` because we want to allow values to be unset.
+class SlidingSyncStateInsertValues(TypedDict, total=False):
+    """
+    Insert values relevant for the `sliding_sync_joined_rooms` and
+    `sliding_sync_membership_snapshots` database tables.
+    """
+
+    room_type: Optional[str]
+    is_encrypted: Optional[bool]
+    room_name: Optional[str]
+
+
+class SlidingSyncMembershipSnapshotSharedInsertValues(
+    SlidingSyncStateInsertValues, total=False
+):
+    """
+    Insert values for `sliding_sync_membership_snapshots` that we can share across
+    multiple memberships
+    """
+
+    has_known_state: Optional[bool]
+    # TODO: tombstone_successor_room_id: Optional[str]
+
+
+@attr.s(slots=True, auto_attribs=True)
+class SlidingSyncMembershipInfo:
+    """
+    Values unique to each membership
+    """
+
+    user_id: str
+    sender: str
+    membership_event_id: str
+
+
+@attr.s(slots=True, auto_attribs=True)
+class SlidingSyncTableChanges:
+    room_id: str
+    # Values to upsert into `sliding_sync_joined_rooms`
+    joined_room_updates: SlidingSyncStateInsertValues
+
+    # Shared values to upsert into `sliding_sync_membership_snapshots` for each
+    # `to_insert_membership_snapshots`
+    membership_snapshot_shared_insert_values: (
+        SlidingSyncMembershipSnapshotSharedInsertValues
+    )
+    # List of membership to insert into `sliding_sync_membership_snapshots`
+    to_insert_membership_snapshots: List[SlidingSyncMembershipInfo]
+    # List of user_id to delete from `sliding_sync_membership_snapshots`
+    to_delete_membership_snapshots: List[str]
 
 
 @attr.s(slots=True, auto_attribs=True)
@@ -167,6 +245,7 @@ class PersistEventsStore:
         new_event_links: Dict[str, NewEventChainLinks],
         use_negative_stream_ordering: bool = False,
         inhibit_local_membership_updates: bool = False,
+        sliding_sync_table_changes: Optional[SlidingSyncTableChanges],
     ) -> None:
         """Persist a set of events alongside updates to the current state and
                 forward extremities tables.
@@ -187,6 +266,7 @@ class PersistEventsStore:
                 from being updated by these events. This should be set to True
                 for backfilled events because backfilled events in the past do
                 not affect the current local state.
+            sliding_sync_table_changes: TODO
 
         Returns:
             Resolves when the events have been persisted
@@ -235,6 +315,7 @@ class PersistEventsStore:
                 state_delta_for_room=state_delta_for_room,
                 new_forward_extremities=new_forward_extremities,
                 new_event_links=new_event_links,
+                sliding_sync_table_changes=sliding_sync_table_changes,
             )
             persist_event_counter.inc(len(events_and_contexts))
 
@@ -458,6 +539,7 @@ class PersistEventsStore:
         state_delta_for_room: Optional[DeltaState],
         new_forward_extremities: Optional[Set[str]],
         new_event_links: Dict[str, NewEventChainLinks],
+        sliding_sync_table_changes: Optional[SlidingSyncTableChanges],
     ) -> None:
         """Insert some number of room events into the necessary database tables.
 
@@ -481,6 +563,7 @@ class PersistEventsStore:
             state_delta_for_room: The current-state delta for the room.
             new_forward_extremities: The new forward extremities for the room:
                 a set of the event ids which are the forward extremities.
+            sliding_sync_table_changes: TODO
 
         Raises:
             PartialStateConflictError: if attempting to persist a partial state event in
@@ -590,9 +673,20 @@ class PersistEventsStore:
         # room_memberships, where applicable.
         # NB: This function invalidates all state related caches
         if state_delta_for_room:
+            # If the state delta exists, the sliding sync table changes should also exist
+            assert sliding_sync_table_changes is not None
+
             self._update_current_state_txn(
-                txn, room_id, state_delta_for_room, min_stream_order
+                txn,
+                room_id,
+                state_delta_for_room,
+                min_stream_order,
+                sliding_sync_table_changes,
             )
+
+        self._update_sliding_sync_tables_with_new_persisted_events_txn(
+            txn, events_and_contexts
+        )
 
     def _persist_event_auth_chain_txn(
         self,
@@ -1128,6 +1222,7 @@ class PersistEventsStore:
         self,
         room_id: str,
         state_delta: DeltaState,
+        sliding_sync_table_changes: SlidingSyncTableChanges,
     ) -> None:
         """Update the current state stored in the datatabase for the given room"""
 
@@ -1141,6 +1236,7 @@ class PersistEventsStore:
                 room_id,
                 delta_state=state_delta,
                 stream_id=stream_ordering,
+                sliding_sync_table_changes=sliding_sync_table_changes,
             )
 
     def _update_current_state_txn(
@@ -1149,16 +1245,20 @@ class PersistEventsStore:
         room_id: str,
         delta_state: DeltaState,
         stream_id: int,
+        sliding_sync_table_changes: SlidingSyncTableChanges,
     ) -> None:
         to_delete = delta_state.to_delete
         to_insert = delta_state.to_insert
+
+        # Sanity check we're processing the same thing
+        assert room_id == sliding_sync_table_changes.room_id
 
         # Figure out the changes of membership to invalidate the
         # `get_rooms_for_user` cache.
         # We find out which membership events we may have deleted
         # and which we have added, then we invalidate the caches for all
         # those users.
-        members_changed = {
+        members_to_cache_bust = {
             state_key
             for ev_type, state_key in itertools.chain(to_delete, to_insert)
             if ev_type == EventTypes.Member
@@ -1182,14 +1282,20 @@ class PersistEventsStore:
                 """
             txn.execute(sql, (stream_id, self._instance_name, room_id))
 
+            # Grab the list of users before we clear out the current state
+            users_in_room = self.store.get_users_in_room_txn(txn, room_id)
             # We also want to invalidate the membership caches for users
             # that were in the room.
-            users_in_room = self.store.get_users_in_room_txn(txn, room_id)
-            members_changed.update(users_in_room)
+            members_to_cache_bust.update(users_in_room)
 
             self.db_pool.simple_delete_txn(
                 txn,
                 table="current_state_events",
+                keyvalues={"room_id": room_id},
+            )
+            self.db_pool.simple_delete_txn(
+                txn,
+                table="sliding_sync_joined_rooms",
                 keyvalues={"room_id": room_id},
             )
         else:
@@ -1260,6 +1366,75 @@ class PersistEventsStore:
                 ],
             )
 
+            # Handle updating the `sliding_sync_joined_rooms` table. We only deal with
+            # updating the state related columns. The
+            # `event_stream_ordering`/`bump_stamp` are updated elsewhere in the event
+            # persisting stack (see
+            # `_update_sliding_sync_tables_with_new_persisted_events_txn()`)
+            #
+            # Pulling keys/values separately is safe and will produce congruent lists
+            insert_keys = sliding_sync_table_changes.joined_room_updates.keys()
+            insert_values = sliding_sync_table_changes.joined_room_updates.values()
+            # We only need to update when one of the relevant state values has changed
+            if insert_keys:
+                # If we have some `to_insert` values, we can use the standard upsert
+                # pattern because we have access to an `event_id` to use for the
+                # `event_stream_ordering` which has a `NON NULL` constraint.
+                if to_insert:
+                    args: List[Any] = [
+                        room_id,
+                        # Even though `Mapping`/`Dict` have no guaranteed order, some
+                        # implementations may preserve insertion order so we're just
+                        # going to choose the best possible answer by using the "first"
+                        # event ID which we will assume will have the greatest
+                        # `stream_ordering`. We really just need *some* answer in case
+                        # we are the first ones inserting into the table because of the
+                        # `NON NULL` constraint on `event_stream_ordering`. In reality,
+                        # `_update_sliding_sync_tables_with_new_persisted_events_txn()`
+                        # is run after this function to update it to the correct latest
+                        # value.
+                        next(iter(to_insert.values())),
+                    ]
+
+                    args.extend(iter(insert_values))
+
+                    # We don't update `event_stream_ordering` `ON CONFLICT` because it's
+                    # simpler and we can just rely on
+                    # `_update_sliding_sync_tables_with_new_persisted_events_txn()` to
+                    # do the right thing (same for `bump_stamp`). The only reason we're
+                    # inserting `event_stream_ordering` here is because the column has a
+                    # `NON NULL` constraint and we need some answer.
+                    txn.execute(
+                        f"""
+                        INSERT INTO sliding_sync_joined_rooms
+                            (room_id, event_stream_ordering, {", ".join(insert_keys)})
+                        VALUES (
+                            ?,
+                            (SELECT stream_ordering FROM events WHERE event_id = ?),
+                            {", ".join("?" for _ in insert_values)}
+                        )
+                        ON CONFLICT (room_id)
+                        DO UPDATE SET
+                            {", ".join(f"{key} = EXCLUDED.{key}" for key in insert_keys)}
+                        """,
+                        args,
+                    )
+
+                # If there are only values `to_delete`, we have to use an `UPDATE`
+                # instead because there is no `event_id` to use for the `NON NULL`
+                # constraint on `event_stream_ordering`.
+                elif to_delete:
+                    args = list(insert_values) + [room_id]
+                    txn.execute(
+                        f"""
+                        UPDATE sliding_sync_joined_rooms
+                        SET
+                            {", ".join(f"{key} = ?" for key in insert_keys)}
+                        WHERE room_id = ?
+                        """,
+                        args,
+                    )
+
         # We now update `local_current_membership`. We do this regardless
         # of whether we're still in the room or not to handle the case where
         # e.g. we just got banned (where we need to record that fact here).
@@ -1296,6 +1471,67 @@ class PersistEventsStore:
                 ],
             )
 
+        # Handle updating the `sliding_sync_membership_snapshots` table
+        #
+        # This would only happen if someone was state reset out of the room
+        if sliding_sync_table_changes.to_delete_membership_snapshots:
+            txn.execute_batch(
+                "DELETE FROM sliding_sync_membership_snapshots"
+                " WHERE room_id = ? AND user_id = ?",
+                [
+                    (room_id, user_id)
+                    for user_id in sliding_sync_table_changes.to_delete_membership_snapshots
+                ],
+            )
+
+        # We do this regardless of whether the server is `no_longer_in_room` or not
+        # because we still want a row if a local user was just left/kicked or got banned
+        # from the room.
+        if sliding_sync_table_changes.to_insert_membership_snapshots:
+            # Update the `sliding_sync_membership_snapshots` table
+            #
+            # Pulling keys/values separately is safe and will produce congruent
+            # lists
+            insert_keys = (
+                sliding_sync_table_changes.membership_snapshot_shared_insert_values.keys()
+            )
+            insert_values = (
+                sliding_sync_table_changes.membership_snapshot_shared_insert_values.values()
+            )
+            # We need to insert/update regardless of whether we have `insert_keys`
+            # because there are other fields in the `ON CONFLICT` upsert to run (see
+            # inherit case above for more context when this happens).
+            txn.execute_batch(
+                f"""
+                INSERT INTO sliding_sync_membership_snapshots
+                    (room_id, user_id, membership_event_id, membership, event_stream_ordering
+                    {("," + ", ".join(insert_keys)) if insert_keys else ""})
+                VALUES (
+                    ?, ?, ?,
+                    (SELECT membership FROM room_memberships WHERE event_id = ?),
+                    (SELECT stream_ordering FROM events WHERE event_id = ?)
+                    {("," + ", ".join("?" for _ in insert_values)) if insert_values else ""}
+                )
+                ON CONFLICT (room_id, user_id)
+                DO UPDATE SET
+                    membership_event_id = EXCLUDED.membership_event_id,
+                    membership = EXCLUDED.membership,
+                    event_stream_ordering = EXCLUDED.event_stream_ordering
+                    {("," + ", ".join(f"{key} = EXCLUDED.{key}" for key in insert_keys)) if insert_keys else ""}
+                """,
+                [
+                    [
+                        room_id,
+                        membership_info.user_id,
+                        membership_info.membership_event_id,
+                        membership_info.membership_event_id,
+                        membership_info.membership_event_id,
+                    ]
+                    + list(insert_values)
+                    for membership_info in sliding_sync_table_changes.to_insert_membership_snapshots
+                ],
+            )
+
         txn.call_after(
             self.store._curr_state_delta_stream_cache.entity_has_changed,
             room_id,
@@ -1303,12 +1539,279 @@ class PersistEventsStore:
         )
 
         # Invalidate the various caches
-        self.store._invalidate_state_caches_and_stream(txn, room_id, members_changed)
+        self.store._invalidate_state_caches_and_stream(
+            txn, room_id, members_to_cache_bust
+        )
 
         # Check if any of the remote membership changes requires us to
         # unsubscribe from their device lists.
         self.store.handle_potentially_left_users_txn(
-            txn, {m for m in members_changed if not self.hs.is_mine_id(m)}
+            txn, {m for m in members_to_cache_bust if not self.hs.is_mine_id(m)}
+        )
+
+    # TODO: We can probably remove this function in favor of other stuff.
+    # TODO: This doesn't take into account redactions
+    @classmethod
+    def _get_relevant_sliding_sync_current_state_event_ids_txn(
+        cls, txn: LoggingTransaction, room_id: str
+    ) -> MutableStateMap[str]:
+        """
+        Fetch the current state event IDs for the relevant (to the
+        `sliding_sync_joined_rooms` table) state types for the given room.
+
+        Returns:
+            StateMap of event IDs necessary to to fetch the relevant state values needed
+            to insert into the
+            `sliding_sync_joined_rooms`/`sliding_sync_membership_snapshots`.
+        """
+        # Fetch the current state event IDs from the database
+        (
+            event_type_and_state_key_in_list_clause,
+            event_type_and_state_key_args,
+        ) = make_tuple_in_list_sql_clause(
+            txn.database_engine,
+            ("type", "state_key"),
+            SLIDING_SYNC_RELEVANT_STATE_SET,
+        )
+        txn.execute(
+            f"""
+            SELECT c.event_id, c.type, c.state_key
+            FROM current_state_events AS c
+            WHERE
+                c.room_id = ?
+                AND {event_type_and_state_key_in_list_clause}
+            """,
+            [room_id] + event_type_and_state_key_args,
+        )
+        current_state_map: MutableStateMap[str] = {
+            (event_type, state_key): event_id for event_id, event_type, state_key in txn
+        }
+
+        return current_state_map
+
+    # TODO: We can probably remove this function in favor of other stuff.
+    # TODO: Should we put this next to the other `_get_sliding_sync_*` function?
+    @classmethod
+    def _get_sliding_sync_insert_values_from_state_ids_map_txn(
+        cls, txn: LoggingTransaction, state_map: StateMap[str]
+    ) -> SlidingSyncStateInsertValues:
+        """
+        Fetch events in the `state_map` and extract the relevant state values needed to
+        insert into the `sliding_sync_joined_rooms`/`sliding_sync_membership_snapshots`
+        tables.
+
+        Returns:
+            Map from column names (`room_type`, `is_encrypted`, `room_name`) to relevant
+            state values needed to insert into
+            the `sliding_sync_joined_rooms`/`sliding_sync_membership_snapshots` tables.
+        """
+        # Map of values to insert/update in the `sliding_sync_membership_snapshots` table
+        sliding_sync_insert_map: SlidingSyncStateInsertValues = {}
+        # Fetch the raw event JSON from the database
+        (
+            event_id_in_list_clause,
+            event_id_args,
+        ) = make_in_list_sql_clause(
+            txn.database_engine,
+            "event_id",
+            state_map.values(),
+        )
+        txn.execute(
+            f"""
+            SELECT type, state_key, json FROM event_json
+            INNER JOIN events USING (event_id)
+            WHERE {event_id_in_list_clause}
+            """,
+            event_id_args,
+        )
+
+        # Parse the raw event JSON
+        for row in txn:
+            event_type, state_key, json = row
+            event_json = db_to_json(json)
+
+            if event_type == EventTypes.Create:
+                room_type = event_json.get("content", {}).get(
+                    EventContentFields.ROOM_TYPE
+                )
+                sliding_sync_insert_map["room_type"] = room_type
+            elif event_type == EventTypes.RoomEncryption:
+                encryption_algorithm = event_json.get("content", {}).get(
+                    EventContentFields.ENCRYPTION_ALGORITHM
+                )
+                is_encrypted = encryption_algorithm is not None
+                sliding_sync_insert_map["is_encrypted"] = is_encrypted
+            elif event_type == EventTypes.Name:
+                room_name = event_json.get("content", {}).get(
+                    EventContentFields.ROOM_NAME
+                )
+                sliding_sync_insert_map["room_name"] = room_name
+            else:
+                # We only expect to see events according to the
+                # `SLIDING_SYNC_RELEVANT_STATE_SET`.
+                raise AssertionError(
+                    f"Unexpected event (we should not be fetching extra events): ({event_type}, {state_key})"
+                )
+
+        return sliding_sync_insert_map
+
+    # TODO: Should we put this next to the other `_get_sliding_sync_*` function?
+    @classmethod
+    def _get_sliding_sync_insert_values_from_stripped_state_txn(
+        cls, txn: LoggingTransaction, unsigned_stripped_state_events: Any
+    ) -> SlidingSyncMembershipSnapshotSharedInsertValues:
+        """
+        Pull out the relevant state values from the stripped state needed to insert into
+        the `sliding_sync_membership_snapshots` tables.
+
+        Returns:
+            Map from column names (`room_type`, `is_encrypted`, `room_name`) to relevant
+            state values needed to insert into the `sliding_sync_membership_snapshots` tables.
+        """
+        # Map of values to insert/update in the `sliding_sync_membership_snapshots` table
+        sliding_sync_insert_map: SlidingSyncMembershipSnapshotSharedInsertValues = {}
+
+        if unsigned_stripped_state_events is not None:
+            stripped_state_map: MutableStateMap[StrippedStateEvent] = {}
+            if isinstance(unsigned_stripped_state_events, list):
+                for raw_stripped_event in unsigned_stripped_state_events:
+                    stripped_state_event = parse_stripped_state_event(
+                        raw_stripped_event
+                    )
+                    if stripped_state_event is not None:
+                        stripped_state_map[
+                            (
+                                stripped_state_event.type,
+                                stripped_state_event.state_key,
+                            )
+                        ] = stripped_state_event
+
+            # If there is some stripped state, we assume the remote server passed *all*
+            # of the potential stripped state events for the room.
+            create_stripped_event = stripped_state_map.get((EventTypes.Create, ""))
+            # Sanity check that we at-least have the create event
+            if create_stripped_event is not None:
+                sliding_sync_insert_map["has_known_state"] = True
+
+                # Find the room_type
+                sliding_sync_insert_map["room_type"] = (
+                    create_stripped_event.content.get(EventContentFields.ROOM_TYPE)
+                    if create_stripped_event is not None
+                    else None
+                )
+
+                # Find whether the room is_encrypted
+                encryption_stripped_event = stripped_state_map.get(
+                    (EventTypes.RoomEncryption, "")
+                )
+                encryption = (
+                    encryption_stripped_event.content.get(
+                        EventContentFields.ENCRYPTION_ALGORITHM
+                    )
+                    if encryption_stripped_event is not None
+                    else None
+                )
+                sliding_sync_insert_map["is_encrypted"] = encryption is not None
+
+                # Find the room_name
+                room_name_stripped_event = stripped_state_map.get((EventTypes.Name, ""))
+                sliding_sync_insert_map["room_name"] = (
+                    room_name_stripped_event.content.get(EventContentFields.ROOM_NAME)
+                    if room_name_stripped_event is not None
+                    else None
+                )
+
+            else:
+                # No strip state provided
+                sliding_sync_insert_map["has_known_state"] = False
+                sliding_sync_insert_map["room_type"] = None
+                sliding_sync_insert_map["room_name"] = None
+                sliding_sync_insert_map["is_encrypted"] = False
+        else:
+            # No strip state provided
+            sliding_sync_insert_map["has_known_state"] = False
+            sliding_sync_insert_map["room_type"] = None
+            sliding_sync_insert_map["room_name"] = None
+            sliding_sync_insert_map["is_encrypted"] = False
+
+        return sliding_sync_insert_map
+
+    def _update_sliding_sync_tables_with_new_persisted_events_txn(
+        self,
+        txn: LoggingTransaction,
+        events_and_contexts: List[Tuple[EventBase, EventContext]],
+    ) -> None:
+        """
+        Update the latest `event_stream_ordering`/`bump_stamp` columns in the
+        `sliding_sync_joined_rooms` table for the room with new events.
+
+        This function assumes that `_store_event_txn()` (to persist the event) and
+        `_update_current_state_txn(...)` (so that `sliding_sync_joined_rooms` table has
+        been updated with rooms that were joined) have already been run.
+
+        Args:
+            txn
+            events_and_contexts: The events being persisted
+        """
+
+        # Handle updating the `sliding_sync_joined_rooms` table.
+        room_id_to_stream_ordering_map: Dict[str, int] = {}
+        room_id_to_bump_stamp_map: Dict[str, int] = {}
+        for event, _ in events_and_contexts:
+            existing_stream_ordering = room_id_to_stream_ordering_map.get(event.room_id)
+            # This should exist for persisted events
+            assert event.internal_metadata.stream_ordering is not None
+
+            # Ignore backfilled events which will have a negative stream ordering
+            if event.internal_metadata.stream_ordering < 0:
+                continue
+
+            if (
+                existing_stream_ordering is None
+                or existing_stream_ordering < event.internal_metadata.stream_ordering
+            ):
+                room_id_to_stream_ordering_map[event.room_id] = (
+                    event.internal_metadata.stream_ordering
+                )
+
+            if event.type in SLIDING_SYNC_DEFAULT_BUMP_EVENT_TYPES:
+                existing_bump_stamp = room_id_to_bump_stamp_map.get(event.room_id)
+                # This should exist at this point because we're inserting events here which require it
+                assert event.internal_metadata.stream_ordering is not None
+                if (
+                    existing_bump_stamp is None
+                    or existing_bump_stamp < event.internal_metadata.stream_ordering
+                ):
+                    room_id_to_bump_stamp_map[event.room_id] = (
+                        event.internal_metadata.stream_ordering
+                    )
+
+        txn.execute_batch(
+            """
+            UPDATE sliding_sync_joined_rooms
+            SET
+                event_stream_ordering = CASE
+                    WHEN event_stream_ordering IS NULL OR event_stream_ordering < ?
+                        THEN ?
+                    ELSE event_stream_ordering
+                END,
+                bump_stamp = CASE
+                    WHEN bump_stamp IS NULL OR bump_stamp < ?
+                        THEN ?
+                    ELSE bump_stamp
+                END
+            WHERE room_id = ?
+            """,
+            [
+                [
+                    room_id_to_stream_ordering_map[room_id],
+                    room_id_to_stream_ordering_map[room_id],
+                    room_id_to_bump_stamp_map.get(room_id),
+                    room_id_to_bump_stamp_map.get(room_id),
+                    room_id,
+                ]
+                for room_id in room_id_to_stream_ordering_map.keys()
+            ],
         )
 
     def _upsert_room_version_txn(self, txn: LoggingTransaction, room_id: str) -> None:
@@ -1931,6 +2434,7 @@ class PersistEventsStore:
         )
 
         for event in events:
+            # Sanity check that we're working with persisted events
             assert event.internal_metadata.stream_ordering is not None
 
             # We update the local_current_membership table only if the event is
@@ -1945,6 +2449,16 @@ class PersistEventsStore:
                 and event.internal_metadata.is_outlier()
                 and event.internal_metadata.is_out_of_band_membership()
             ):
+                # The only sort of out-of-band-membership events we expect to see here
+                # are remote invites/knocks and LEAVE events corresponding to
+                # rejected/retracted invites and rescinded knocks.
+                assert event.type == EventTypes.Member
+                assert event.membership in (
+                    Membership.INVITE,
+                    Membership.KNOCK,
+                    Membership.LEAVE,
+                )
+
                 self.db_pool.simple_upsert_txn(
                     txn,
                     table="local_current_membership",
@@ -1954,6 +2468,54 @@ class PersistEventsStore:
                         "event_stream_ordering": event.internal_metadata.stream_ordering,
                         "membership": event.membership,
                     },
+                )
+
+                # Handle updating the `sliding_sync_membership_snapshots` table
+                # (out-of-band membership events only)
+                #
+                raw_stripped_state_events = None
+                if event.membership == Membership.INVITE:
+                    invite_room_state = event.unsigned.get("invite_room_state")
+                    raw_stripped_state_events = invite_room_state
+                elif event.membership == Membership.KNOCK:
+                    knock_room_state = event.unsigned.get("knock_room_state")
+                    raw_stripped_state_events = knock_room_state
+
+                insert_values = {
+                    "membership_event_id": event.event_id,
+                    "membership": event.membership,
+                    "event_stream_ordering": event.internal_metadata.stream_ordering,
+                }
+                if event.membership == Membership.LEAVE:
+                    # Inherit the meta data from the remote invite/knock. When using
+                    # sliding sync filters, this will prevent the room from
+                    # disappearing/appearing just because you left the room.
+                    pass
+                elif event.membership in (Membership.INVITE, Membership.KNOCK):
+                    extra_insert_values = (
+                        self._get_sliding_sync_insert_values_from_stripped_state_txn(
+                            txn, raw_stripped_state_events
+                        )
+                    )
+                    insert_values.update(extra_insert_values)
+                else:
+                    # We don't know how to handle this type of membership yet
+                    #
+                    # FIXME: We should use `assert_never` here but for some reason
+                    # the exhaustive matching doesn't recognize the `Never` here.
+                    # assert_never(event.membership)
+                    raise AssertionError(
+                        f"Unexpected out-of-band membership {event.membership} ({event.event_id}) that we don't know how to handle yet"
+                    )
+
+                self.db_pool.simple_upsert_txn(
+                    txn,
+                    table="sliding_sync_membership_snapshots",
+                    keyvalues={
+                        "room_id": event.room_id,
+                        "user_id": event.state_key,
+                    },
+                    values=insert_values,
                 )
 
     def _handle_event_relations(
