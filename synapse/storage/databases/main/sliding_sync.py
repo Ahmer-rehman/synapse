@@ -30,6 +30,7 @@ from synapse.types.handlers.sliding_sync import (
     RoomStatusMap,
     RoomSyncConfig,
 )
+from synapse.util.caches.descriptors import cached
 
 if TYPE_CHECKING:
     from synapse.storage.databases.main import DataStore
