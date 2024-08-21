@@ -2,7 +2,7 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 # Copyright 2014-2016 OpenMarket Ltd
-# Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2023-2024 New Vector, Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -194,7 +194,9 @@ class RoomStateEventRestServlet(RestServlet):
         self.event_creation_handler = hs.get_event_creation_handler()
         self.room_member_handler = hs.get_room_member_handler()
         self.message_handler = hs.get_message_handler()
+        self.delayed_events_handler = hs.get_delayed_events_handler()
         self.auth = hs.get_auth()
+        self._msc4140_max_delay = hs.config.experimental.msc4140_max_delay
 
     def register(self, http_server: HttpServer) -> None:
         # /rooms/$roomid/state/$eventtype
@@ -290,6 +292,22 @@ class RoomStateEventRestServlet(RestServlet):
         if requester.app_service:
             origin_server_ts = parse_integer(request, "ts")
 
+        delay = _parse_request_delay(request, self._msc4140_max_delay)
+        if delay is not None:
+            delay_id = await self.delayed_events_handler.add(
+                requester,
+                room_id=room_id,
+                event_type=event_type,
+                state_key=state_key,
+                origin_server_ts=origin_server_ts,
+                content=content,
+                delay=delay,
+            )
+
+            set_tag("delay_id", delay_id)
+            ret = {"delay_id": delay_id}
+            return 200, ret
+
         try:
             if event_type == EventTypes.Member:
                 membership = content.get("membership", None)
@@ -340,7 +358,9 @@ class RoomSendEventRestServlet(TransactionRestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
         self.event_creation_handler = hs.get_event_creation_handler()
+        self.delayed_events_handler = hs.get_delayed_events_handler()
         self.auth = hs.get_auth()
+        self._msc4140_max_delay = hs.config.experimental.msc4140_max_delay
 
     def register(self, http_server: HttpServer) -> None:
         # /rooms/$roomid/send/$event_type[/$txn_id]
@@ -357,6 +377,26 @@ class RoomSendEventRestServlet(TransactionRestServlet):
     ) -> Tuple[int, JsonDict]:
         content = parse_json_object_from_request(request)
 
+        origin_server_ts = None
+        if requester.app_service:
+            origin_server_ts = parse_integer(request, "ts")
+
+        delay = _parse_request_delay(request, self._msc4140_max_delay)
+        if delay is not None:
+            delay_id = await self.delayed_events_handler.add(
+                requester,
+                room_id=room_id,
+                event_type=event_type,
+                state_key=None,
+                origin_server_ts=origin_server_ts,
+                content=content,
+                delay=delay,
+            )
+
+            set_tag("delay_id", delay_id)
+            ret = {"delay_id": delay_id}
+            return 200, ret
+
         event_dict: JsonDict = {
             "type": event_type,
             "content": content,
@@ -364,10 +404,8 @@ class RoomSendEventRestServlet(TransactionRestServlet):
             "sender": requester.user.to_string(),
         }
 
-        if requester.app_service:
-            origin_server_ts = parse_integer(request, "ts")
-            if origin_server_ts is not None:
-                event_dict["origin_server_ts"] = origin_server_ts
+        if origin_server_ts is not None:
+            event_dict["origin_server_ts"] = origin_server_ts
 
         try:
             (
@@ -408,6 +446,23 @@ class RoomSendEventRestServlet(TransactionRestServlet):
             event_type,
             txn_id,
         )
+
+
+def _parse_request_delay(request: SynapseRequest, max_delay: int) -> Optional[int]:
+    delay = parse_integer(request, "org.matrix.msc4140.delay")
+    if delay is None:
+        return None
+    if delay > max_delay:
+        raise SynapseError(
+            HTTPStatus.BAD_REQUEST,
+            "The requested delay exceeds the allowed maximum.",
+            Codes.UNKNOWN,
+            {
+                "org.matrix.msc4140.errcode": "M_MAX_DELAY_EXCEEDED",
+                "org.matrix.msc4140.max_delay": max_delay,
+            },
+        )
+    return delay
 
 
 # TODO: Needs unit testing for room ID + alias joins
