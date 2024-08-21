@@ -20,11 +20,15 @@ CREATE TABLE sliding_sync_connection_state(
     created_ts BIGINT NOT NULL
 );
 
+CREATE INDEX sliding_sync_connection_state_conn_idx ON sliding_sync_connection_state(user_id, device_id, conn_id);
+
 CREATE TABLE sliding_sync_connection_state_positions(
     connection_position BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     connection_key BIGINT NOT NULL REFERENCES sliding_sync_connection_state(connection_key) ON DELETE CASCADE,
     created_ts BIGINT NOT NULL
 );
+
+CREATE INDEX sliding_sync_connection_state_positions_key ON sliding_sync_connection_state_positions(connection_key);
 
 
 CREATE TABLE sliding_sync_connection_required_state(

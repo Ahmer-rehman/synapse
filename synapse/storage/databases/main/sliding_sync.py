@@ -85,6 +85,15 @@ class SlidingSyncStore(SQLBaseStore):
 
             (connection_key,) = row
         else:
+            self.db_pool.simple_delete_txn(
+                txn,
+                table="sliding_sync_connection_state",
+                keyvalues={
+                    "user_id": user_id,
+                    "device_id": device_id,
+                    "conn_id": conn_id,
+                },
+            )
             (connection_key,) = self.db_pool.simple_insert_returning_txn(
                 txn,
                 table="sliding_sync_connection_state",
