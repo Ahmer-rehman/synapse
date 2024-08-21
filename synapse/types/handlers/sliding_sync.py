@@ -734,6 +734,9 @@ class RoomStatusMap(Generic[T]):
 
         return RoomStatusMap(statuses=dict(self._statuses))
 
+    def __len__(self) -> int:
+        return len(self._statuses)
+
 
 class MutableRoomStatusMap(RoomStatusMap[T]):
     """A mutable version of `RoomStatusMap`"""
